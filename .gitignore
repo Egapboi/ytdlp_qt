@@ -1,0 +1,29 @@
+# Python Runtime Artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE & System Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local Media Downloads (to avoid committing test downloads)
+*.mp4
+*.mp3
+*.m4a
+*.webm
+*.mkv
+*.jpg
+*.jpeg
+*.png
+*.webp
