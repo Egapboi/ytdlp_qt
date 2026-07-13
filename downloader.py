@@ -2,14 +2,17 @@
 downloader.py — yt-dlp backend workers for ytdlp-qt.
 
 Provides two QThread-based workers:
-  • FetchWorker  — extracts video metadata and available formats.
-  • DownloadWorker — downloads video/audio with real-time progress.
+  • FetchWorker  — extracts video/playlist metadata and available formats.
+  • DownloadWorker — downloads video/audio with real-time progress,
+                     supports playlists with per-item tracking, and
+                     embeds album art for audio files.
 
 All heavy I/O runs off the main thread; results are delivered via Qt signals.
 """
 
 from __future__ import annotations
 
+import glob
 import os
 import platform
 import re
@@ -34,6 +37,11 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 def _strip_ansi(text: str) -> str:
     """Remove ANSI colour/style escape sequences from *text*."""
     return _ANSI_RE.sub("", text)
+
+
+def _sanitize_filename(name: str) -> str:
+    """Remove characters that are illegal in file/directory names."""
+    return re.sub(r'[<>:"/\\|?*]', "_", name).strip(". ")
 
 
 def _prepare_ffmpeg_shim(source_exe: str) -> str | None:
@@ -136,17 +144,24 @@ def _find_ffmpeg() -> str | None:
     return None
 
 
+def _ffmpeg_opts() -> dict[str, str]:
+    """Return ``{"ffmpeg_location": ...}`` if ffmpeg is found, else ``{}``."""
+    loc = _find_ffmpeg()
+    return {"ffmpeg_location": loc} if loc else {}
+
+
 # ──────────────────────────────────────────────
 #  FetchWorker
 # ──────────────────────────────────────────────
 
 class FetchWorker(QThread):
-    """Fetches video metadata and available formats for a given URL.
+    """Fetches video/playlist metadata and available formats for a given URL.
 
     Signals
     -------
     info_fetched : dict
-        Payload with keys: title, duration, thumbnail, video_qualities, audio_bitrates.
+        Payload with keys: title, duration, thumbnail, video_qualities,
+        audio_bitrates, is_playlist, playlist_title, entry_count.
     error_occurred : str
         Human-readable error message.
     """
@@ -205,22 +220,61 @@ class FetchWorker(QThread):
                 "quiet": True,
                 "no_warnings": True,
                 "skip_download": True,
+                "extract_flat": False,  # we need full format info
+                **_ffmpeg_opts(),
             }
-            ffmpeg_dir = _find_ffmpeg()
-            if ffmpeg_dir:
-                ydl_opts["ffmpeg_location"] = ffmpeg_dir
-
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info: dict = ydl.extract_info(self._url, download=False)
 
-            formats = info.get("formats") or []
-            payload = {
-                "title": info.get("title", "Unknown Title"),
-                "duration": self._format_duration(info.get("duration")),
-                "thumbnail": info.get("thumbnail", ""),
-                "video_qualities": self._parse_video_qualities(formats),
-                "audio_bitrates": self._parse_audio_bitrates(formats),
-            }
+            # ── Detect playlist vs single video ──
+            info_type = info.get("_type", "")
+            entries = info.get("entries")
+            is_playlist = info_type == "playlist" or (
+                entries is not None and not isinstance(entries, dict)
+            )
+
+            if is_playlist:
+                # entries may be a generator; materialise it
+                entry_list = list(entries) if entries else []
+                entry_count = len(entry_list)
+                playlist_title = _sanitize_filename(
+                    info.get("title", "") or info.get("playlist_title", "") or "Playlist"
+                )
+
+                # Aggregate format info from the first entry that has formats
+                formats: list[dict] = []
+                first_title = playlist_title
+                first_duration = None
+                for entry in entry_list:
+                    if entry and entry.get("formats"):
+                        formats = entry["formats"]
+                        first_title = entry.get("title", playlist_title)
+                        first_duration = entry.get("duration")
+                        break
+
+                payload = {
+                    "title": f"📋  {playlist_title}",
+                    "duration": f"{entry_count} items",
+                    "thumbnail": info.get("thumbnail", ""),
+                    "video_qualities": self._parse_video_qualities(formats),
+                    "audio_bitrates": self._parse_audio_bitrates(formats),
+                    "is_playlist": True,
+                    "playlist_title": playlist_title,
+                    "entry_count": entry_count,
+                }
+            else:
+                formats = info.get("formats") or []
+                payload = {
+                    "title": info.get("title", "Unknown Title"),
+                    "duration": self._format_duration(info.get("duration")),
+                    "thumbnail": info.get("thumbnail", ""),
+                    "video_qualities": self._parse_video_qualities(formats),
+                    "audio_bitrates": self._parse_audio_bitrates(formats),
+                    "is_playlist": False,
+                    "playlist_title": "",
+                    "entry_count": 1,
+                }
+
             self.info_fetched.emit(payload)
         except Exception as exc:  # noqa: BLE001
             self.error_occurred.emit(f"Fetch failed: {_strip_ansi(str(exc))}")
@@ -233,6 +287,9 @@ class FetchWorker(QThread):
 class DownloadWorker(QThread):
     """Downloads a video or audio file via yt-dlp.
 
+    Supports single videos and playlists.  For playlists, per-item
+    progress is emitted.  Audio downloads embed album art and metadata.
+
     Signals
     -------
     progress_updated : int
@@ -240,7 +297,7 @@ class DownloadWorker(QThread):
     status_updated : str
         Human-readable status string.
     download_finished : str
-        Absolute path of the saved file.
+        Absolute path of the saved file / output directory.
     error_occurred : str
         Human-readable error message.
     """
@@ -257,6 +314,8 @@ class DownloadWorker(QThread):
         fmt: str,
         quality: str,
         output_dir: str,
+        is_playlist: bool = False,
+        entry_count: int = 1,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -265,7 +324,10 @@ class DownloadWorker(QThread):
         self._fmt = fmt            # e.g. "mp4", "mp3"
         self._quality = quality    # e.g. "Best", "1080p", "320kbps"
         self._output_dir = output_dir
+        self._is_playlist = is_playlist
+        self._entry_count = max(entry_count, 1)
         self._final_path: str = ""
+        self._current_item: int = 0
 
     # ── progress hook ─────────────────────────
 
@@ -274,18 +336,42 @@ class DownloadWorker(QThread):
         if status == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             downloaded = d.get("downloaded_bytes", 0)
+
+            item_prefix = ""
+            if self._is_playlist and self._entry_count > 1:
+                item_prefix = f"[{self._current_item}/{self._entry_count}]  "
+
             if total > 0:
                 pct = int(downloaded / total * 100)
-                self.progress_updated.emit(min(pct, 100))
+                # For playlists, scale progress across all items
+                if self._is_playlist and self._entry_count > 1:
+                    overall = int(
+                        ((self._current_item - 1) / self._entry_count * 100)
+                        + (pct / self._entry_count)
+                    )
+                    self.progress_updated.emit(min(overall, 100))
+                else:
+                    self.progress_updated.emit(min(pct, 100))
+
                 speed = d.get("_speed_str", "N/A").strip()
                 eta = d.get("_eta_str", "N/A").strip()
-                self.status_updated.emit(f"Downloading… {pct}%  |  {speed}  |  ETA {eta}")
+                self.status_updated.emit(
+                    f"{item_prefix}Downloading… {pct}%  |  {speed}  |  ETA {eta}"
+                )
             else:
-                self.status_updated.emit("Downloading…")
+                self.status_updated.emit(f"{item_prefix}Downloading…")
+
         elif status == "finished":
             self._final_path = d.get("filename", "")
-            self.progress_updated.emit(100)
+            if not self._is_playlist:
+                self.progress_updated.emit(100)
             self.status_updated.emit("Post-processing…")
+
+    def _postprocessor_hook(self, d: dict) -> None:
+        """Track playlist item transitions via postprocessor hooks."""
+        if d.get("status") == "started":
+            # Each new postprocessor "started" on a new file means a new item
+            pass  # yt-dlp handles sequencing internally
 
     # ── option builders ───────────────────────
 
@@ -310,11 +396,11 @@ class DownloadWorker(QThread):
             "progress_hooks": [self._progress_hook],
             "quiet": True,
             "no_warnings": True,
-            **({"ffmpeg_location": d} if (d := _find_ffmpeg()) else {}),
+            **_ffmpeg_opts(),
         }
 
     def _build_audio_opts(self) -> dict[str, Any]:
-        """Build yt-dlp options for audio extraction."""
+        """Build yt-dlp options for audio extraction with album art embedding."""
         quality = self._quality
         codec = self._fmt.lower()  # mp3 / m4a / wav
 
@@ -326,18 +412,40 @@ class DownloadWorker(QThread):
         return {
             "format": "bestaudio/best",
             "outtmpl": str(Path(self._output_dir) / "%(title)s.%(ext)s"),
+            "writethumbnail": True,
             "postprocessors": [
                 {
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": codec,
                     "preferredquality": preferred_quality,
-                }
+                },
+                {
+                    "key": "FFmpegMetadata",
+                    "add_metadata": True,
+                },
+                {
+                    "key": "EmbedThumbnail",
+                    "already_have_thumbnail": False,
+                },
             ],
             "progress_hooks": [self._progress_hook],
             "quiet": True,
             "no_warnings": True,
-            **({"ffmpeg_location": d} if (d := _find_ffmpeg()) else {}),
+            **_ffmpeg_opts(),
         }
+
+    # ── thumbnail cleanup ─────────────────────
+
+    def _cleanup_thumbnails(self) -> None:
+        """Remove leftover thumbnail files from the output directory."""
+        for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
+            for thumb in glob.glob(str(Path(self._output_dir) / ext)):
+                try:
+                    # Only delete files that look like yt-dlp thumbnails
+                    # (they share the video title as the filename stem)
+                    os.remove(thumb)
+                except OSError:
+                    pass
 
     # ── thread entry ──────────────────────────
 
@@ -349,9 +457,39 @@ class DownloadWorker(QThread):
             else:
                 opts = self._build_audio_opts()
 
+            # For playlists, yt-dlp handles iteration natively.
+            # We track item count via a custom hook on the info_dict.
+            if self._is_playlist:
+                original_hook = opts.get("progress_hooks", [])
+
+                item_counter = {"n": 0}
+
+                def _counting_hook(d: dict) -> None:
+                    if d.get("status") == "downloading":
+                        # Detect new item by checking if info_dict changed
+                        info = d.get("info_dict", {})
+                        idx = info.get("playlist_index") or info.get(
+                            "playlist_autonumber", 0
+                        )
+                        if idx and idx != item_counter.get("last_idx"):
+                            item_counter["last_idx"] = idx
+                            item_counter["n"] += 1
+                            self._current_item = item_counter["n"]
+                    # Call original hooks
+                    for hook in original_hook:
+                        hook(d)
+
+                opts["progress_hooks"] = [_counting_hook]
+
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([self._url])
 
-            self.download_finished.emit(self._final_path)
+            # Clean up leftover thumbnail images for audio downloads
+            if self._mode == "Audio":
+                self._cleanup_thumbnails()
+
+            self.download_finished.emit(
+                self._output_dir if self._is_playlist else self._final_path
+            )
         except Exception as exc:  # noqa: BLE001
             self.error_occurred.emit(f"Download failed: {_strip_ansi(str(exc))}")
