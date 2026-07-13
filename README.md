@@ -59,7 +59,7 @@ Follow these steps to configure and run the application locally on any Windows, 
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/Egapboi/ytdlp-qt.git
+git clone https://github.com/Egapboi/ytdlp_qt.git
 cd ytdlp-qt
 ```
 
