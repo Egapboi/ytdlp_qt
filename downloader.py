@@ -34,6 +34,11 @@ import yt_dlp
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
+class DownloadCancelledError(Exception):
+    """Custom exception raised when download is cancelled by the user."""
+    pass
+
+
 def _strip_ansi(text: str) -> str:
     """Remove ANSI colour/style escape sequences from *text*."""
     return _ANSI_RE.sub("", text)
@@ -359,10 +364,18 @@ class DownloadWorker(QThread):
         self._entry_count = len(self._playlist_entries) if is_playlist and playlist_entries else max(entry_count, 1)
         self._final_path: str = ""
         self._current_item: int = 0
+        self._is_cancelled = False
+
+    def cancel(self) -> None:
+        """Cancel the download thread execution gracefully."""
+        self._is_cancelled = True
 
     # ── progress hook ─────────────────────────
 
     def _progress_hook(self, d: dict) -> None:
+        if self._is_cancelled:
+            raise DownloadCancelledError("Cancelled")
+
         status = d.get("status", "")
         if status == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
@@ -400,6 +413,8 @@ class DownloadWorker(QThread):
 
     def _postprocessor_hook(self, d: dict) -> None:
         """Track playlist item transitions via postprocessor hooks."""
+        if self._is_cancelled:
+            raise DownloadCancelledError("Cancelled")
         if d.get("status") == "started":
             # Each new postprocessor "started" on a new file means a new item
             pass  # yt-dlp handles sequencing internally
@@ -488,6 +503,9 @@ class DownloadWorker(QThread):
                 failed_items = []
                 total_items = len(self._playlist_entries)
                 for i, entry in enumerate(self._playlist_entries, 1):
+                    if self._is_cancelled:
+                        raise DownloadCancelledError("Cancelled")
+
                     self._current_item = i
                     video_id = entry.get("id")
                     item_url = entry.get("url") or f"https://www.youtube.com/watch?v={video_id}"
@@ -505,7 +523,11 @@ class DownloadWorker(QThread):
                         with yt_dlp.YoutubeDL(opts) as ydl:
                             ydl.download([item_url])
                         self.log_message.emit(f"✓ Succeeded ({i}/{total_items}): {item_title}")
+                    except DownloadCancelledError:
+                        raise
                     except Exception as e:
+                        if self._is_cancelled:
+                            raise DownloadCancelledError("Cancelled")
                         clean_err = _strip_ansi(str(e))
                         short_err = clean_err[:60] + "..." if len(clean_err) > 60 else clean_err
                         self.status_updated.emit(f"⚠ Item {i} failed. Skipping...")
@@ -538,6 +560,8 @@ class DownloadWorker(QThread):
                     item_counter = {"n": 0}
 
                     def _counting_hook(d: dict) -> None:
+                        if self._is_cancelled:
+                            raise DownloadCancelledError("Cancelled")
                         if d.get("status") == "downloading":
                             info = d.get("info_dict", {})
                             idx = info.get("playlist_index") or info.get(
@@ -562,5 +586,8 @@ class DownloadWorker(QThread):
                 self.download_finished.emit(
                     self._output_dir if self._is_playlist else self._final_path
                 )
+        except DownloadCancelledError:
+            self.log_message.emit("⚠  Download cancelled by user.")
+            self.download_finished.emit("Cancelled")
         except Exception as exc:  # noqa: BLE001
             self.error_occurred.emit(f"Download failed: {_strip_ansi(str(exc))}")

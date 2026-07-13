@@ -17,6 +17,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QIcon
 from PyQt6.QtWidgets import (
     QComboBox,
+    QDialog,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -204,8 +205,74 @@ QMessageBox QPushButton {
 """
 
 # ──────────────────────────────────────────────
-#  MainWindow
+#  PlaylistFolderDialog
 # ──────────────────────────────────────────────
+
+class PlaylistFolderDialog(QDialog):
+    """Dialog asking the user where to save playlist items.
+    
+    Guarantees no button text clipping by using dynamic layout scaling
+    and an appropriate minimum width for horizontal options.
+    """
+
+    def __init__(self, playlist_title: str, current_dir: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Playlist Detected")
+        
+        # Apply style sheet of parent
+        if parent:
+            self.setStyleSheet(parent.styleSheet())
+            
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(16)
+        
+        lbl_text = QLabel(
+            f'The URL is a playlist: "<b>{playlist_title}</b>".<br><br>'
+            f"Where would you like to save the files?"
+        )
+        lbl_text.setTextFormat(Qt.TextFormat.RichText)
+        lbl_text.setWordWrap(True)
+        layout.addWidget(lbl_text)
+        
+        lbl_info = QLabel(
+            f'• <b>Create New Folder</b> → {current_dir}/{playlist_title}/<br>'
+            f'• <b>Save to Selected Folder</b> → {current_dir}/'
+        )
+        lbl_info.setTextFormat(Qt.TextFormat.RichText)
+        lbl_info.setWordWrap(True)
+        lbl_info.setStyleSheet("color: #a6adc8;")
+        layout.addWidget(lbl_info)
+        
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(12)
+        
+        self.btn_create = QPushButton("Create New Folder")
+        self.btn_save = QPushButton("Save to Selected Folder")
+        self.btn_cancel = QPushButton("Cancel")
+        
+        self.btn_create.setObjectName("btn_create")
+        self.btn_save.setObjectName("btn_save")
+        self.btn_cancel.setObjectName("btn_cancel")
+        
+        # Style secondary buttons with dark grey
+        self.btn_save.setStyleSheet("background-color: #45475a; color: #cdd6f4;")
+        self.btn_cancel.setStyleSheet("background-color: #45475a; color: #cdd6f4;")
+        
+        btn_layout.addWidget(self.btn_create)
+        btn_layout.addWidget(self.btn_save)
+        btn_layout.addWidget(self.btn_cancel)
+        
+        layout.addLayout(btn_layout)
+        
+        # Signals
+        self.btn_create.clicked.connect(lambda: self.done(1))
+        self.btn_save.clicked.connect(lambda: self.done(2))
+        self.btn_cancel.clicked.connect(lambda: self.done(0))
+        
+        # Ensure buttons have ample space
+        self.setMinimumWidth(520)
+
 
 VIDEO_FORMATS = ["MP4", "MKV", "WebM"]
 AUDIO_FORMATS = ["MP3", "M4A", "WAV"]
@@ -322,7 +389,9 @@ class MainWindow(QMainWindow):
 
         root_layout.addWidget(dir_group)
 
-        # ── Download Button ──────────────────
+        # ── Buttons Layout (Download & Cancel) ──
+        btn_layout = QHBoxLayout()
+
         self.btn_download = QPushButton("Download")
         self.btn_download.setEnabled(False)
         self.btn_download.setSizePolicy(
@@ -331,7 +400,20 @@ class MainWindow(QMainWindow):
         font = self.btn_download.font()
         font.setPointSize(12)
         self.btn_download.setFont(font)
-        root_layout.addWidget(self.btn_download)
+        btn_layout.addWidget(self.btn_download)
+
+        self.btn_cancel = QPushButton("Cancel Download")
+        self.btn_cancel.setObjectName("btn_cancel")
+        self.btn_cancel.setVisible(False)
+        self.btn_cancel.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        self.btn_cancel.setFont(font)
+        # Style cancel button as red/warning
+        self.btn_cancel.setStyleSheet("background-color: #f38ba8; color: #1e1e2e;")
+        btn_layout.addWidget(self.btn_cancel)
+
+        root_layout.addLayout(btn_layout)
 
         # ── Progress ─────────────────────────
         self.progress_bar = QProgressBar()
@@ -374,6 +456,7 @@ class MainWindow(QMainWindow):
         self.url_input.returnPressed.connect(self._on_fetch)
         self.btn_browse.clicked.connect(self._on_browse)
         self.btn_download.clicked.connect(self._on_download)
+        self.btn_cancel.clicked.connect(self._on_cancel)
         self.combo_mode.currentTextChanged.connect(self._update_options_for_mode)
 
     # ──────────────────────────────────────────
@@ -468,32 +551,16 @@ class MainWindow(QMainWindow):
         """
         current_dir = self.dir_input.text().strip()
 
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Playlist Detected")
-        msg.setText(
-            f'The URL is a playlist: "{playlist_title}".\n\n'
-            f"Where would you like to save the files?"
-        )
-        msg.setInformativeText(
-            f'• "Create New Folder" → {current_dir}/{playlist_title}/\n'
-            f'• "Save to Selected Folder" → {current_dir}/'
-        )
+        dialog = PlaylistFolderDialog(playlist_title, current_dir, parent=self)
+        result = dialog.exec()
 
-        btn_create = msg.addButton("Create New Folder", QMessageBox.ButtonRole.AcceptRole)
-        btn_save = msg.addButton("Save to Selected Folder", QMessageBox.ButtonRole.ActionRole)
-        btn_cancel = msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-
-        msg.setDefaultButton(btn_create)
-        msg.exec()
-
-        clicked = msg.clickedButton()
-        if clicked == btn_create:
+        if result == 1:
             new_dir = str(Path(current_dir) / playlist_title)
             os.makedirs(new_dir, exist_ok=True)
             self.dir_input.setText(new_dir)
             self._log(f"📁  Created folder: {new_dir}")
             return new_dir
-        elif clicked == btn_save:
+        elif result == 2:
             self._log(f"📁  Saving to: {current_dir}")
             return current_dir
         else:
@@ -559,13 +626,46 @@ class MainWindow(QMainWindow):
 
     # ── Helpers ───────────────────────────────
 
+    def _on_cancel(self) -> None:
+        """Trigger graceful worker cancellation on user interrupt."""
+        if self._download_worker and self._download_worker.isRunning():
+            self._log("⏳ Interrupt requested. Cancelling remaining downloads...")
+            self.lbl_status.setText("Cancelling...")
+            self.btn_cancel.setEnabled(False)
+            self._download_worker.cancel()
+
+    def closeEvent(self, event) -> None:
+        """Ensure background threads are safely terminated before app closing."""
+        if self._fetch_worker and self._fetch_worker.isRunning():
+            self._fetch_worker.terminate()
+            self._fetch_worker.wait()
+        if self._download_worker and self._download_worker.isRunning():
+            self._download_worker.cancel()
+            self._download_worker.wait()
+        event.accept()
+
     def _set_ui_busy(self, busy: bool, message: str = "") -> None:
         """Enable/disable interactive elements while a worker is active."""
         self.btn_fetch.setEnabled(not busy)
         self.url_input.setEnabled(not busy)
-        self.btn_download.setEnabled(not busy and self._fetched_info is not None)
         self.combo_mode.setEnabled(not busy)
         self.combo_format.setEnabled(not busy)
         self.combo_quality.setEnabled(not busy)
+
+        if busy:
+            if message == "Fetching metadata…":
+                self.btn_download.setEnabled(False)
+                self.btn_download.setVisible(True)
+                self.btn_cancel.setVisible(False)
+            else:
+                # Downloading
+                self.btn_download.setVisible(False)
+                self.btn_cancel.setVisible(True)
+                self.btn_cancel.setEnabled(True)
+        else:
+            self.btn_cancel.setVisible(False)
+            self.btn_download.setVisible(True)
+            self.btn_download.setEnabled(self._fetched_info is not None)
+
         if message:
             self._log(message)
