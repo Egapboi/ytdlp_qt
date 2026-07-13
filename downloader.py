@@ -220,7 +220,8 @@ class FetchWorker(QThread):
                 "quiet": True,
                 "no_warnings": True,
                 "skip_download": True,
-                "extract_flat": False,  # we need full format info
+                "ignoreerrors": True,
+                "extract_flat": "in_playlist",
                 **_ffmpeg_opts(),
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -236,21 +237,44 @@ class FetchWorker(QThread):
             if is_playlist:
                 # entries may be a generator; materialise it
                 entry_list = list(entries) if entries else []
-                entry_count = len(entry_list)
+                
+                # Filter out broken or unavailable entries
+                valid_entries = []
+                skipped_items = []
+                for idx, entry in enumerate(entry_list, 1):
+                    if not entry:
+                        skipped_items.append(f"Item {idx} (Unavailable)")
+                        continue
+                    title = entry.get("title")
+                    if title in ("[Deleted video]", "[Private video]", None):
+                        skipped_items.append(title or f"Item {idx} (Private/Deleted)")
+                        continue
+                    valid_entries.append(entry)
+
+                entry_count = len(valid_entries)
                 playlist_title = _sanitize_filename(
                     info.get("title", "") or info.get("playlist_title", "") or "Playlist"
                 )
 
-                # Aggregate format info from the first entry that has formats
+                # Aggregate format info from the first valid entry that has formats
                 formats: list[dict] = []
-                first_title = playlist_title
-                first_duration = None
-                for entry in entry_list:
-                    if entry and entry.get("formats"):
-                        formats = entry["formats"]
-                        first_title = entry.get("title", playlist_title)
-                        first_duration = entry.get("duration")
-                        break
+                for entry in valid_entries:
+                    entry_url = entry.get("url") or f"https://www.youtube.com/watch?v={entry.get('id')}"
+                    try:
+                        single_opts = {
+                            "quiet": True,
+                            "no_warnings": True,
+                            "skip_download": True,
+                            "extract_flat": False,
+                            **_ffmpeg_opts(),
+                        }
+                        with yt_dlp.YoutubeDL(single_opts) as ydl_single:
+                            single_info = ydl_single.extract_info(entry_url, download=False)
+                            if single_info and single_info.get("formats"):
+                                formats = single_info["formats"]
+                                break
+                    except Exception:
+                        pass
 
                 payload = {
                     "title": f"📋  {playlist_title}",
@@ -261,6 +285,8 @@ class FetchWorker(QThread):
                     "is_playlist": True,
                     "playlist_title": playlist_title,
                     "entry_count": entry_count,
+                    "playlist_entries": valid_entries,
+                    "skipped_items": skipped_items,
                 }
             else:
                 formats = info.get("formats") or []
@@ -273,6 +299,8 @@ class FetchWorker(QThread):
                     "is_playlist": False,
                     "playlist_title": "",
                     "entry_count": 1,
+                    "playlist_entries": None,
+                    "skipped_items": [],
                 }
 
             self.info_fetched.emit(payload)
@@ -306,6 +334,7 @@ class DownloadWorker(QThread):
     status_updated = pyqtSignal(str)
     download_finished = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
+    log_message = pyqtSignal(str)
 
     def __init__(
         self,
@@ -316,6 +345,7 @@ class DownloadWorker(QThread):
         output_dir: str,
         is_playlist: bool = False,
         entry_count: int = 1,
+        playlist_entries: list[dict] | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -325,7 +355,8 @@ class DownloadWorker(QThread):
         self._quality = quality    # e.g. "Best", "1080p", "320kbps"
         self._output_dir = output_dir
         self._is_playlist = is_playlist
-        self._entry_count = max(entry_count, 1)
+        self._playlist_entries = playlist_entries or []
+        self._entry_count = len(self._playlist_entries) if is_playlist and playlist_entries else max(entry_count, 1)
         self._final_path: str = ""
         self._current_item: int = 0
 
@@ -452,44 +483,84 @@ class DownloadWorker(QThread):
     def run(self) -> None:  # noqa: D401
         try:
             self.status_updated.emit("Preparing download…")
-            if self._mode == "Video":
-                opts = self._build_video_opts()
+
+            if self._is_playlist and self._playlist_entries:
+                failed_items = []
+                total_items = len(self._playlist_entries)
+                for i, entry in enumerate(self._playlist_entries, 1):
+                    self._current_item = i
+                    video_id = entry.get("id")
+                    item_url = entry.get("url") or f"https://www.youtube.com/watch?v={video_id}"
+                    item_title = entry.get("title", f"Video {i}")
+
+                    self.status_updated.emit(f"[{i}/{total_items}] Preparing: {item_title}")
+                    self.log_message.emit(f"⏳ Downloading ({i}/{total_items}): {item_title}...")
+
+                    try:
+                        if self._mode == "Video":
+                            opts = self._build_video_opts()
+                        else:
+                            opts = self._build_audio_opts()
+
+                        with yt_dlp.YoutubeDL(opts) as ydl:
+                            ydl.download([item_url])
+                        self.log_message.emit(f"✓ Succeeded ({i}/{total_items}): {item_title}")
+                    except Exception as e:
+                        clean_err = _strip_ansi(str(e))
+                        short_err = clean_err[:60] + "..." if len(clean_err) > 60 else clean_err
+                        self.status_updated.emit(f"⚠ Item {i} failed. Skipping...")
+                        self.log_message.emit(f"✗ Failed ({i}/{total_items}): {item_title} - {short_err}")
+                        failed_items.append((i, item_title))
+                        continue
+
+                # Clean up leftover thumbnail images for audio downloads
+                if self._mode == "Audio":
+                    self._cleanup_thumbnails()
+
+                # Process completion summary
+                success_count = total_items - len(failed_items)
+                summary = f"✓ Process complete. {success_count}/{total_items} files downloaded successfully."
+                if failed_items:
+                    summary += f" {len(failed_items)} items failed."
+
+                self.download_finished.emit(summary)
+
             else:
-                opts = self._build_audio_opts()
+                # Single video download
+                if self._mode == "Video":
+                    opts = self._build_video_opts()
+                else:
+                    opts = self._build_audio_opts()
 
-            # For playlists, yt-dlp handles iteration natively.
-            # We track item count via a custom hook on the info_dict.
-            if self._is_playlist:
-                original_hook = opts.get("progress_hooks", [])
+                # For fallback, if is_playlist is set but entries are not populated, let yt-dlp iterate natively
+                if self._is_playlist:
+                    original_hook = opts.get("progress_hooks", [])
+                    item_counter = {"n": 0}
 
-                item_counter = {"n": 0}
+                    def _counting_hook(d: dict) -> None:
+                        if d.get("status") == "downloading":
+                            info = d.get("info_dict", {})
+                            idx = info.get("playlist_index") or info.get(
+                                "playlist_autonumber", 0
+                            )
+                            if idx and idx != item_counter.get("last_idx"):
+                                item_counter["last_idx"] = idx
+                                item_counter["n"] += 1
+                                self._current_item = item_counter["n"]
+                        for hook in original_hook:
+                            hook(d)
 
-                def _counting_hook(d: dict) -> None:
-                    if d.get("status") == "downloading":
-                        # Detect new item by checking if info_dict changed
-                        info = d.get("info_dict", {})
-                        idx = info.get("playlist_index") or info.get(
-                            "playlist_autonumber", 0
-                        )
-                        if idx and idx != item_counter.get("last_idx"):
-                            item_counter["last_idx"] = idx
-                            item_counter["n"] += 1
-                            self._current_item = item_counter["n"]
-                    # Call original hooks
-                    for hook in original_hook:
-                        hook(d)
+                    opts["progress_hooks"] = [_counting_hook]
 
-                opts["progress_hooks"] = [_counting_hook]
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    ydl.download([self._url])
 
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([self._url])
+                # Clean up leftover thumbnail images for audio downloads
+                if self._mode == "Audio":
+                    self._cleanup_thumbnails()
 
-            # Clean up leftover thumbnail images for audio downloads
-            if self._mode == "Audio":
-                self._cleanup_thumbnails()
-
-            self.download_finished.emit(
-                self._output_dir if self._is_playlist else self._final_path
-            )
+                self.download_finished.emit(
+                    self._output_dir if self._is_playlist else self._final_path
+                )
         except Exception as exc:  # noqa: BLE001
             self.error_occurred.emit(f"Download failed: {_strip_ansi(str(exc))}")

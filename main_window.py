@@ -445,6 +445,11 @@ class MainWindow(QMainWindow):
         if info.get("is_playlist"):
             count = info.get("entry_count", 0)
             self._log(f"✓  Playlist detected: {info['playlist_title']}  ·  {count} items")
+            skipped = info.get("skipped_items", [])
+            if skipped:
+                self._log(f"⚠  Notice: {len(skipped)} unavailable video(s) skipped during playlist scanning.")
+                for item in skipped:
+                    self._log(f"   - Skipped: {item}")
         else:
             self._log(f"✓  Fetched: {info['title']}")
 
@@ -518,6 +523,7 @@ class MainWindow(QMainWindow):
         mode = self.combo_mode.currentText()
         fmt = self.combo_format.currentText()
         quality = self.combo_quality.currentText()
+        playlist_entries = (self._fetched_info or {}).get("playlist_entries", None)
 
         self._set_ui_busy(True, "Preparing download…")
         self.progress_bar.setValue(0)
@@ -530,10 +536,12 @@ class MainWindow(QMainWindow):
             output_dir=output_dir,
             is_playlist=is_playlist,
             entry_count=entry_count,
+            playlist_entries=playlist_entries,
             parent=self,
         )
         self._download_worker.progress_updated.connect(self.progress_bar.setValue)
         self._download_worker.status_updated.connect(self.lbl_status.setText)
+        self._download_worker.log_message.connect(self._log)
         self._download_worker.download_finished.connect(self._on_download_finished)
         self._download_worker.error_occurred.connect(self._on_download_error)
         self._download_worker.finished.connect(lambda: self._set_ui_busy(False))
