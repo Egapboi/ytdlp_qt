@@ -42,7 +42,7 @@ def main() -> None:
     app.setStyleSheet(DARK_STYLE)
 
     window = MainWindow()
-    window.show()
+    window.showMaximized()
 
     sys.exit(app.exec())
 
