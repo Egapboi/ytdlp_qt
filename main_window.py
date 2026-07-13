@@ -3,7 +3,8 @@ main_window.py — PyQt6 user interface for ytdlp-qt.
 
 Single-window layout with URL input, mode toggle, dynamic format/quality
 selectors, output directory picker, download button, progress bar, and
-status log.  Uses a dark theme via QSS.
+status log.  Supports playlist detection with a folder-creation dialog.
+Uses a dark theme via QSS.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -187,6 +189,17 @@ QLabel#lbl_status {
 QLabel#lbl_ffmpeg_notice {
     color: #f9e2af;
     padding: 4px 0px;
+}
+
+/* ── Message Box (dark-themed) ──────────── */
+QMessageBox {
+    background-color: #1e1e2e;
+}
+QMessageBox QLabel {
+    color: #cdd6f4;
+}
+QMessageBox QPushButton {
+    min-width: 90px;
 }
 """
 
@@ -428,12 +441,59 @@ class MainWindow(QMainWindow):
         self.lbl_duration.setText(f"Duration: {info['duration']}")
         self._update_options_for_mode()
         self.btn_download.setEnabled(True)
-        self._log(f"✓  Fetched: {info['title']}")
+
+        if info.get("is_playlist"):
+            count = info.get("entry_count", 0)
+            self._log(f"✓  Playlist detected: {info['playlist_title']}  ·  {count} items")
+        else:
+            self._log(f"✓  Fetched: {info['title']}")
 
     def _on_fetch_error(self, msg: str) -> None:
         self.lbl_title.setText("—")
         self.lbl_duration.setText("")
         self._log(f"✗  {msg}")
+
+    # ── Playlist Folder Dialog ────────────────
+
+    def _show_playlist_dialog(self, playlist_title: str) -> str | None:
+        """Show a dialog asking how to handle playlist output directory.
+
+        Returns:
+            The resolved output directory path, or None if the user cancelled.
+        """
+        current_dir = self.dir_input.text().strip()
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Playlist Detected")
+        msg.setText(
+            f'The URL is a playlist: "{playlist_title}".\n\n'
+            f"Where would you like to save the files?"
+        )
+        msg.setInformativeText(
+            f'• "Create New Folder" → {current_dir}/{playlist_title}/\n'
+            f'• "Save to Selected Folder" → {current_dir}/'
+        )
+
+        btn_create = msg.addButton("Create New Folder", QMessageBox.ButtonRole.AcceptRole)
+        btn_save = msg.addButton("Save to Selected Folder", QMessageBox.ButtonRole.ActionRole)
+        btn_cancel = msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+
+        msg.setDefaultButton(btn_create)
+        msg.exec()
+
+        clicked = msg.clickedButton()
+        if clicked == btn_create:
+            new_dir = str(Path(current_dir) / playlist_title)
+            os.makedirs(new_dir, exist_ok=True)
+            self.dir_input.setText(new_dir)
+            self._log(f"📁  Created folder: {new_dir}")
+            return new_dir
+        elif clicked == btn_save:
+            self._log(f"📁  Saving to: {current_dir}")
+            return current_dir
+        else:
+            self._log("⚠  Download cancelled.")
+            return None
 
     # ── Download ──────────────────────────────
 
@@ -443,6 +503,17 @@ class MainWindow(QMainWindow):
         if not url or not output_dir:
             self._log("⚠  URL and output directory are required.")
             return
+
+        is_playlist = bool(self._fetched_info and self._fetched_info.get("is_playlist"))
+        entry_count = (self._fetched_info or {}).get("entry_count", 1)
+        playlist_title = (self._fetched_info or {}).get("playlist_title", "")
+
+        # ── Playlist folder dialog ──
+        if is_playlist:
+            resolved_dir = self._show_playlist_dialog(playlist_title)
+            if resolved_dir is None:
+                return  # user cancelled
+            output_dir = resolved_dir
 
         mode = self.combo_mode.currentText()
         fmt = self.combo_format.currentText()
@@ -457,6 +528,8 @@ class MainWindow(QMainWindow):
             fmt=fmt,
             quality=quality,
             output_dir=output_dir,
+            is_playlist=is_playlist,
+            entry_count=entry_count,
             parent=self,
         )
         self._download_worker.progress_updated.connect(self.progress_bar.setValue)
