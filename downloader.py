@@ -17,6 +17,8 @@ import os
 import platform
 import re
 import shutil
+import subprocess
+import sys
 import traceback
 from pathlib import Path
 from typing import Any
@@ -153,6 +155,50 @@ def _ffmpeg_opts() -> dict[str, str]:
     """Return ``{"ffmpeg_location": ...}`` if ffmpeg is found, else ``{}``."""
     loc = _find_ffmpeg()
     return {"ffmpeg_location": loc} if loc else {}
+
+
+# ──────────────────────────────────────────────
+#  UpdateWorker
+# ──────────────────────────────────────────────
+
+class UpdateWorker(QThread):
+    """Upgrades yt-dlp package using the active Python executable.
+
+    Signals
+    -------
+    update_status : str
+        Status message while checking or installing.
+    update_finished : bool, str
+        Success flag and detail message.
+    """
+
+    update_status = pyqtSignal(str)
+    update_finished = pyqtSignal(bool, str)
+
+    def run(self) -> None:
+        try:
+            self.update_status.emit("Checking for yt-dlp updates...")
+            cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"]
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            
+            if result.returncode == 0:
+                # Successfully ran pip. Reload yt_dlp to get the new version in memory.
+                import importlib
+                try:
+                    importlib.reload(yt_dlp)
+                except Exception:
+                    pass
+                version = yt_dlp.version.__version__
+                self.update_finished.emit(True, f"yt-dlp updated successfully (Version: {version})")
+            else:
+                self.update_finished.emit(False, f"Update failed: {result.stderr or result.stdout}")
+        except Exception as e:
+            self.update_finished.emit(False, f"Update failed: {e}")
 
 
 # ──────────────────────────────────────────────

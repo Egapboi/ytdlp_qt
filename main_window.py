@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from downloader import DownloadWorker, FetchWorker
+from downloader import DownloadWorker, FetchWorker, UpdateWorker
 
 # ──────────────────────────────────────────────
 #  Dark-theme stylesheet
@@ -294,10 +294,14 @@ class MainWindow(QMainWindow):
         self._fetched_info: dict | None = None
         self._fetch_worker: FetchWorker | None = None
         self._download_worker: DownloadWorker | None = None
+        self._update_worker: UpdateWorker | None = None
 
         self._build_ui()
         self._connect_signals()
         self._update_options_for_mode()
+
+        # Check and upgrade yt-dlp engine in the background on startup
+        self._on_update_engine()
 
     # ──────────────────────────────────────────
     #  UI Construction
@@ -310,11 +314,21 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(20, 16, 20, 16)
         root_layout.setSpacing(12)
 
-        # Header
+        # Header Layout
+        header_layout = QHBoxLayout()
         lbl_header = QLabel("ytdlp-qt")
         lbl_header.setObjectName("lbl_header")
-        lbl_header.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        root_layout.addWidget(lbl_header)
+        
+        self.btn_update_engine = QPushButton("Update Engine")
+        self.btn_update_engine.setObjectName("btn_update_engine")
+        self.btn_update_engine.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
+        self.btn_update_engine.setStyleSheet("padding: 4px 12px; background-color: #45475a; color: #cdd6f4;")
+        
+        header_layout.addWidget(lbl_header, stretch=1)
+        header_layout.addWidget(self.btn_update_engine)
+        root_layout.addLayout(header_layout)
 
         # ── URL Group ────────────────────────
         url_group = QGroupBox("URL")
@@ -457,6 +471,7 @@ class MainWindow(QMainWindow):
         self.btn_browse.clicked.connect(self._on_browse)
         self.btn_download.clicked.connect(self._on_download)
         self.btn_cancel.clicked.connect(self._on_cancel)
+        self.btn_update_engine.clicked.connect(self._on_update_engine)
         self.combo_mode.currentTextChanged.connect(self._update_options_for_mode)
 
     # ──────────────────────────────────────────
@@ -634,6 +649,30 @@ class MainWindow(QMainWindow):
             self.btn_cancel.setEnabled(False)
             self._download_worker.cancel()
 
+    def _on_update_engine(self) -> None:
+        """Initialize background upgrade thread for yt-dlp."""
+        self._log("⏳ Initializing engine update check...")
+        self.btn_update_engine.setEnabled(False)
+        self.btn_update_engine.setText("Updating...")
+
+        self._update_worker = UpdateWorker(parent=self)
+        self._update_worker.update_status.connect(self._log)
+        self._update_worker.update_finished.connect(self._on_update_finished)
+        self._update_worker.finished.connect(lambda: self._set_update_button_busy(False))
+        self._update_worker.start()
+
+    def _on_update_finished(self, success: bool, msg: str) -> None:
+        """Print results of the engine upgrade command."""
+        if success:
+            self._log(f"✓  {msg}")
+        else:
+            self._log(f"✗  {msg}")
+
+    def _set_update_button_busy(self, busy: bool) -> None:
+        self.btn_update_engine.setEnabled(not busy)
+        if not busy:
+            self.btn_update_engine.setText("Update Engine")
+
     def closeEvent(self, event) -> None:
         """Ensure background threads are safely terminated before app closing."""
         if self._fetch_worker and self._fetch_worker.isRunning():
@@ -642,6 +681,9 @@ class MainWindow(QMainWindow):
         if self._download_worker and self._download_worker.isRunning():
             self._download_worker.cancel()
             self._download_worker.wait()
+        if self._update_worker and self._update_worker.isRunning():
+            self._update_worker.terminate()
+            self._update_worker.wait()
         event.accept()
 
     def _set_ui_busy(self, busy: bool, message: str = "") -> None:
@@ -651,6 +693,7 @@ class MainWindow(QMainWindow):
         self.combo_mode.setEnabled(not busy)
         self.combo_format.setEnabled(not busy)
         self.combo_quality.setEnabled(not busy)
+        self.btn_update_engine.setEnabled(not busy)
 
         if busy:
             if message == "Fetching metadata…":
