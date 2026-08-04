@@ -443,8 +443,8 @@ class DownloadWorker(QThread):
                 else:
                     self.progress_updated.emit(min(pct, 100))
 
-                speed = d.get("_speed_str", "N/A").strip()
-                eta = d.get("_eta_str", "N/A").strip()
+                speed = _strip_ansi(d.get("_speed_str", "N/A")).strip()
+                eta = _strip_ansi(d.get("_eta_str", "N/A")).strip()
                 self.status_updated.emit(
                     f"{item_prefix}Downloading… {pct}%  |  {speed}  |  ETA {eta}"
                 )
